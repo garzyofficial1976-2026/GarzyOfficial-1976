@@ -1,0 +1,199 @@
+name: Flutter Build AAB
+
+# Ditrigger oleh bot Telegram melalui workflow_dispatch.
+# Input kompatibel dengan triggerWorkflow() yang mengirim:
+# zip_url, tag, build_type.
+# Simpan sebagai: .github/workflows/flutter_aab_build.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Flutter (GitHub Release asset)"
+        required: true
+        type: string
+      tag:
+        description: "Tag unik build (dipakai untuk nama artifact)"
+        required: true
+        type: string
+      build_type:
+        description: "Mode build: debug atau release"
+        required: false
+        default: "release"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Validasi input wajib
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          BUILD_TAG: ${{ inputs.tag }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::Input zip_url kosong."
+            exit 1
+          fi
+
+          if [ -z "$BUILD_TAG" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
+
+          case "$ZIP_URL" in
+            https://*) ;;
+            *)
+              echo "::error::zip_url harus menggunakan HTTPS."
+              exit 1
+              ;;
+          esac
+
+          if [ "$BUILD_TYPE" != "debug" ] && [ "$BUILD_TYPE" != "release" ]; then
+            echo "::error::build_type harus debug atau release."
+            exit 1
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # Flutter 3.41.9 dipin agar hasil build konsisten.
+      # Jika dependency project membutuhkan versi lain, sesuaikan versi ini.
+      - name: Setup Flutter SDK (3.41.9)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Tampilkan versi tool
+        run: |
+          java -version
+          flutter --version
+          dart --version
+
+      - name: Download ZIP project
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          curl --location --fail --show-error --silent \
+            --retry 3 --retry-delay 2 \
+            "$ZIP_URL" \
+            --output project.zip
+
+          if ! unzip -t project.zip >/dev/null; then
+            echo "::error::File yang diunduh bukan ZIP valid."
+            exit 1
+          fi
+
+      - name: Extract ZIP
+        run: |
+          set -euo pipefail
+          rm -rf project
+          mkdir -p project
+          unzip -q project.zip -d project
+
+          # Jika ZIP berisi satu folder pembungkus dan pubspec.yaml ada
+          # di dalam folder tersebut, pindahkan isi folder ke project/.
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+
+          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp="$(mktemp -d)"
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+
+      - name: Validasi struktur project Flutter
+        run: |
+          set -euo pipefail
+
+          if [ ! -f project/pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di root project."
+            echo "Pastikan ZIP berisi project Flutter yang valid."
+            exit 1
+          fi
+
+          if [ ! -d project/android ]; then
+            echo "::error::Folder android/ tidak ditemukan."
+            exit 1
+          fi
+
+          if [ ! -f project/android/gradlew ]; then
+            echo "::error::android/gradlew tidak ditemukan. Sertakan Gradle Wrapper di ZIP."
+            exit 1
+          fi
+
+          chmod +x project/android/gradlew
+
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      - name: Flutter Analyze
+        working-directory: project
+        run: flutter analyze --no-pub
+
+      - name: Build AAB
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build appbundle --debug
+            AAB_DIR="build/app/outputs/bundle/debug"
+          else
+            flutter build appbundle --release
+            AAB_DIR="build/app/outputs/bundle/release"
+          fi
+
+          if [ ! -d "$AAB_DIR" ] || ! find "$AAB_DIR" -maxdepth 1 -type f -name "*.aab" -print -quit | grep -q .; then
+            echo "::error::File AAB tidak ditemukan di $AAB_DIR."
+            find build/app/outputs -maxdepth 5 -type f -print || true
+            exit 1
+          fi
+
+          mkdir -p ../aab-output
+          find "$AAB_DIR" -maxdepth 1 -type f -name "*.aab" -exec cp {} ../aab-output/ \;
+
+      - name: Upload AAB sebagai artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-${{ inputs.tag }}
+          path: aab-output/*.aab
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Ringkasan build
+        if: success()
+        env:
+          BUILD_TAG: ${{ inputs.tag }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          {
+            echo "## ✅ Flutter AAB Build Success"
+            echo ""
+            echo "- Tag: \`$BUILD_TAG\`"
+            echo "- Mode: \`$BUILD_TYPE\`"
+            echo "- Output: Android App Bundle (.aab)"
+            echo "- Artifact: \`aab-$BUILD_TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
